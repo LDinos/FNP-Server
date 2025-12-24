@@ -491,21 +491,38 @@ app.post("/dm/conversation", requireAuth, async (req: AuthRequest, res) => {
 
 app.get("/dm/:conversationId/messages", requireAuth, async (req: AuthRequest, res) => {
     const { conversationId } = req.params;
+    const limit = Number(req.query.limit ?? 20);
+    const cursor = req.query.cursor as string | undefined;
 
     const messages = await prisma.message.findMany({
       where: { conversationId },
-      orderBy: { createdAt: "asc" },
-      take: 50,
+      orderBy: { createdAt: "desc" },
+      take: limit + 1, // fetch one extra to detect "hasMore"
+      ...(cursor && {
+        cursor: { id: cursor },
+        skip: 1,
+      }),
       include: {
         sender: {
-          select: { id: true, username: true, avatarUrl: true },
+          select: {
+            id: true,
+            username: true,
+            avatarUrl: true,
+          },
         },
       },
     });
 
-    res.send(messages);
+    const hasMore = messages.length > limit;
+    const items = hasMore ? messages.slice(0, limit) : messages;
+
+    res.json({
+      messages: items.reverse(), // oldest → newest
+      nextCursor: hasMore ? items[items.length - 1].id : null,
+    });
   }
 );
+
 
 app.post("/dm/message", requireAuth, async (req: AuthRequest, res) => {
   const userId = req.userId!;
@@ -656,7 +673,7 @@ app.post(
     }
 
     const avatarUrl = `/uploads/avatars/${req.file.filename}`;
-    
+
     // Fetch current avatar
     const existingUser = await prisma.user.findUnique({
       where: { id: req.userId! },
