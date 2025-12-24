@@ -5,6 +5,8 @@ const JWT_SECRET = "dev-secret";
 
 export interface AuthRequest extends Request {
   userId?: string;
+  file?: any;
+  files?: any[];
 }
 
 export function requireAuth(

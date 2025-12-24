@@ -21,6 +21,7 @@ model User {
   password  String
   status    UserStatus @default(ONLINE)
   createdAt DateTime   @default(now())
+  avatarUrl String?
 
   sentRequests     FriendRequest[] @relation("SentRequests")
   receivedRequests FriendRequest[] @relation("ReceivedRequests")
@@ -28,6 +29,7 @@ model User {
   friendsB         Friend[]        @relation("UserBFriends")
   conversations    ConversationParticipant[]
   messagesSent     Message[] @relation("MessageSender")
+  messageReads MessageRead[]
 }
 
 model FriendRequest {
@@ -82,6 +84,19 @@ model Message {
 
   conversation Conversation @relation(fields: [conversationId], references: [id])
   sender       User         @relation("MessageSender", fields: [senderId], references: [id])
+  reads MessageRead[]
+}
+
+model MessageRead {
+  id        String   @id @default(uuid())
+  messageId String
+  userId    String
+  readAt    DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@unique([messageId, userId])
 }
 
 

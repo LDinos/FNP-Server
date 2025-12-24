@@ -9,13 +9,48 @@ import { requireAuth } from "./middleware/auth";
 import { authenticateSocket } from "./socketAuth";
 import { userConnected, userDisconnected, getOnlineUserIds, onlineUsers } from "./presence";
 import type { AuthRequest } from "./middleware/auth";
+import path from "path";
+import multer from "multer";
+import fs from "fs";
+
+const BASE_URL = process.env.BASE_URL || "http://localhost:3001";
+const SVELTE_URL = process.env.SVELTE_URL || "http://localhost:5173";
+const avatarDir = path.join(__dirname, "../uploads/avatars");
+const UPLOADS_BASE_URL = BASE_URL + "/uploads/avatars/";
+const AVATAR_UPLOAD_DIR = path.join(__dirname, "../uploads/avatars/");
+
+if (!fs.existsSync(avatarDir)) {
+  fs.mkdirSync(avatarDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, avatarDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${req.userId}-${Date.now()}${ext}`);
+  },
+});
+
+const uploadAvatar = multer({
+  storage,
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      cb(new Error("Only images allowed"));
+    } else {
+      cb(null, true);
+    }
+  },
+});
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173", // SvelteKit dev
+    origin: SVELTE_URL, // SvelteKit dev
     methods: ["GET", "POST"],
   },
 });
@@ -25,9 +60,10 @@ server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
 
+app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: SVELTE_URL,
     credentials: true,
   })
 );
@@ -49,6 +85,7 @@ app.get("/auth/me", requireAuth, async (req, res) => {
       username: true,
       createdAt: true,
       status: true,
+      avatarUrl: true
     },
   });
 
@@ -71,7 +108,7 @@ io.on("connection", async (socket) => {
   // 👇 FIX: mark user as ONLINE if they were OFFLINE
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { status: true },
+    select: { status: true, avatarUrl: true },
   });
 
   if (user?.status === "OFFLINE") {
@@ -113,6 +150,25 @@ io.on("connection", async (socket) => {
   });
 
 });
+
+function deleteAvatarIfExists(avatarUrl: string | null) {
+  if (!avatarUrl) return;
+
+  // Only delete avatars uploaded to our server
+  if (!avatarUrl.startsWith("/uploads/avatars/")) return;
+
+  const filename = avatarUrl.replace("/uploads/avatars/", "");
+  const filePath = path.join(AVATAR_UPLOAD_DIR, filename);
+  console.log("Deleting old avatar at path:", filePath);
+
+  if (fs.existsSync(filePath)) {
+    fs.unlink(filePath, (err) => {
+      if (err) {
+        console.error("Failed to delete old avatar:", err);
+      }
+    });
+  }
+}
 
 app.post("/auth/login", async (req: AuthRequest, res) => {
   console.log("LOGIN BODY:", req.body);
@@ -294,10 +350,10 @@ app.get("/friends", requireAuth, async (req: AuthRequest, res) => {
       userAId: true,
       userBId: true,
       userA: {
-        select: { id: true, username: true, status: true },
+        select: { id: true, username: true, status: true, avatarUrl: true },
       },
       userB: {
-        select: { id: true, username: true, status: true },
+        select: { id: true, username: true, status: true, avatarUrl: true },
       },
     },
   });
@@ -385,6 +441,7 @@ app.get("/presence", requireAuth, async (req: AuthRequest, res) => {
     select: {
       id: true,
       status: true,
+      avatarUrl: true
     },
   });
   // Create a mapping of userId to status
@@ -432,10 +489,7 @@ app.post("/dm/conversation", requireAuth, async (req: AuthRequest, res) => {
   res.send(conversation);
 });
 
-app.get(
-  "/dm/:conversationId/messages",
-  requireAuth,
-  async (req: AuthRequest, res) => {
+app.get("/dm/:conversationId/messages", requireAuth, async (req: AuthRequest, res) => {
     const { conversationId } = req.params;
 
     const messages = await prisma.message.findMany({
@@ -444,7 +498,7 @@ app.get(
       take: 50,
       include: {
         sender: {
-          select: { id: true, username: true },
+          select: { id: true, username: true, avatarUrl: true },
         },
       },
     });
@@ -469,7 +523,7 @@ app.post("/dm/message", requireAuth, async (req: AuthRequest, res) => {
     },
     include: {
       sender: {
-        select: { id: true, username: true },
+        select: { id: true, username: true, avatarUrl: true },
       },
     },
   });
@@ -503,6 +557,7 @@ app.get("/dm/conversations", requireAuth, async (req: AuthRequest, res) => {
               id: true,
               username: true,
               status: true,
+              avatarUrl: true
             },
           },
         },
@@ -523,4 +578,106 @@ app.get("/dm/conversations", requireAuth, async (req: AuthRequest, res) => {
 
   res.send(conversations);
 });
+
+app.post("/dm/read", requireAuth, async (req: AuthRequest, res) => {
+  const userId = req.userId!;
+  const { conversationId } = req.body;
+
+  // get messages not sent by this user
+  const messages = await prisma.message.findMany({
+    where: {
+      conversationId,
+      senderId: { not: userId },
+    },
+    select: { id: true },
+  });
+
+  // mark them as read (ignore duplicates)
+  await prisma.messageRead.createMany({
+    data: messages.map((m) => ({
+      messageId: m.id,
+      userId,
+    })),
+    skipDuplicates: true,
+  });
+
+  // notify other participants (read receipt)
+  const participants = await prisma.conversationParticipant.findMany({
+    where: { conversationId },
+  });
+
+  participants
+    .filter((p) => p.userId !== userId)
+    .forEach((p) => {
+      io.to(p.userId).emit("dm:read", {
+        conversationId,
+        userId,
+      });
+    });
+
+  res.send({ ok: true });
+});
+
+app.get("/dm/:conversationId/reads", requireAuth, async (req: AuthRequest, res) => {
+    const { conversationId } = req.params;
+    const userId = req.userId!;
+
+    const reads = await prisma.messageRead.findMany({
+      where: {
+        message: { conversationId },
+        userId: { not: userId }, // 👈 only other user
+      },
+      select: {
+        messageId: true,
+      },
+    });
+
+    res.send(reads.map((r) => r.messageId));
+  }
+);
+
+app.post("/auth/logout", (_req, res) => {
+  res.clearCookie("token", {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false, // true in production (HTTPS)
+  });
+
+  res.send({ ok: true });
+});
+
+app.post(
+  "/profile/avatar",
+  requireAuth,
+  uploadAvatar.single("avatar"),
+  async (req: AuthRequest, res) => {
+    if (!req.file) {
+      return res.status(400).send("No file uploaded");
+    }
+
+    const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+    
+    // Fetch current avatar
+    const existingUser = await prisma.user.findUnique({
+      where: { id: req.userId! },
+      select: { avatarUrl: true },
+    });
+
+    const user = await prisma.user.update({
+      where: { id: req.userId! },
+      data: { avatarUrl },
+      select: {
+        id: true,
+        username: true,
+        avatarUrl: true,
+      },
+    });
+
+    // Delete old avatar if needed
+    deleteAvatarIfExists(existingUser?.avatarUrl ?? null);
+
+    res.send(user);
+  }
+);
+
 
